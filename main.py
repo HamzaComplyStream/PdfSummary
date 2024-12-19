@@ -270,7 +270,7 @@ async def upload_pdf(file: UploadFile = File(...)):
 
 # API Endpoint for S3 File Deletion
 @app.delete("/delete_file")
-async def delete_s3_file(request: S3DeleteRequest):
+async def delete_file(request: S3DeleteRequest):
     """
     API endpoint to delete a file from S3 bucket
     
