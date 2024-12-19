@@ -57,6 +57,9 @@ class S3DeleteRequest(BaseModel):
 #             return "\n".join([page.extract_text() for page in pdf.pages])
 #     except Exception as e:
 #         raise HTTPException(status_code=400, detail=f"Error reading PDF: {str(e)}")
+###-----------------------------------------------------------------------------------------------------------------------------###
+
+###---------------------------------------Text Extraction Function --------------------------------------------------------------###
 
 def extract_text_from_s3_pdf(bucket_name: str, object_key: str) -> str:
     """
@@ -112,6 +115,9 @@ def extract_text_from_s3_pdf(bucket_name: str, object_key: str) -> str:
             status_code=500, 
             detail=f"Unexpected error extracting text from PDF: {str(e)}"
         )
+###-----------------------------------------------------------------------------------------------------------------------------###
+
+###---------------------------------------Pdf upload to s3 Function --------------------------------------------------------------###
 
 def upload_bytes_to_s3(
     file_bytes: bytes, 
@@ -232,7 +238,7 @@ def delete_file_from_s3(bucket_name: str, object_key: str) -> dict:
 
 ###---------------------------------------Define API End-points--------------------------------------------------------------###
 
-@app.post("/upload-pdf")
+@app.post("/upload_pdf")
 async def upload_pdf(file: UploadFile = File(...)):
     """
     API endpoint to upload PDF file
@@ -263,7 +269,7 @@ async def upload_pdf(file: UploadFile = File(...)):
         return e
 
 # API Endpoint for S3 File Deletion
-@app.delete("/delete-s3-file")
+@app.delete("/delete_file")
 async def delete_s3_file(request: S3DeleteRequest):
     """
     API endpoint to delete a file from S3 bucket
@@ -287,6 +293,7 @@ async def delete_s3_file(request: S3DeleteRequest):
         # Re-raise HTTP exceptions
         raise e
 
+# API Endpoint for generating summary from given context of pdf
 @app.post("/generate_summary")
 def generate_summary(request: S3DeleteRequest):
     try:
