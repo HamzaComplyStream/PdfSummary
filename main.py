@@ -31,8 +31,8 @@ session = boto3.Session(
 
 ###---------------------------------------Define Base models for each points of the apis---------------------------------------###
 # Define Base model for requesting generate_summary endpoint
-class RequestData(BaseModel):
-    pdf_path: str
+# class RequestData(BaseModel):
+#     pdf_path: str
 
 # Pydantic model for request body
 class S3DeleteRequest(BaseModel):
