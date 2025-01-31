@@ -10,6 +10,12 @@ from botocore.exceptions import ClientError
 from pydantic import BaseModel
 import magic  # For file type validation
 import json
+from scanned import is_scanned_pdf
+from mongo_store import insert_document
+from datetime import datetime
+import prompts
+
+today = datetime.today().strftime('%Y-%m-%d')
 
 app = FastAPI()
 
@@ -31,35 +37,19 @@ session = boto3.Session(
 
 ###---------------------------------------Define Base models for each points of the apis---------------------------------------###
 # Define Base model for requesting generate_summary endpoint
-# class RequestData(BaseModel):
-#     pdf_path: str
+class RequestData(BaseModel):
+    pdf_path: str
 
 # Pydantic model for request body
 class S3DeleteRequest(BaseModel):
     bucket_name: str
     object_key: str
+    file_name: str
 
 ###---------------------------------------Define Support Functions--------------------------------------------------------------###
 
 
-# def extract_text_from_pdf(pdf_path: str) -> str:
-#     """
-#     Extract raw text from PDF
-    
-#     Args:
-#         pdf_path (str): Path to PDF file
-    
-#     Returns:
-#         str: Extracted text from PDF
-#     """
-#     try:
-#         with pdfplumber.open(pdf_path) as pdf:
-#             return "\n".join([page.extract_text() for page in pdf.pages])
-#     except Exception as e:
-#         raise HTTPException(status_code=400, detail=f"Error reading PDF: {str(e)}")
-###-----------------------------------------------------------------------------------------------------------------------------###
 
-###---------------------------------------Text Extraction Function --------------------------------------------------------------###
 
 def extract_text_from_s3_pdf(bucket_name: str, object_key: str) -> str:
     """
@@ -94,30 +84,32 @@ def extract_text_from_s3_pdf(bucket_name: str, object_key: str) -> str:
         
         # Use BytesIO to create file-like object from S3 bytes
         pdf_file = io.BytesIO(pdf_bytes)
+        print(is_scanned_pdf(pdf_file))
+        is_scanned = is_scanned_pdf(pdf_file)
+
+        if is_scanned is True:
+            return {"is_scanned":True,"text":None}
+        else:
         
-        # Extract text using pdfplumber
-        try:
-            with pdfplumber.open(pdf_file) as pdf:
-                # Extract text from each page and join
-                extracted_text = "\n".join([
-                    page.extract_text() or "" for page in pdf.pages
-                ])
-        except Exception as pdf_error:
-            raise HTTPException(
-                status_code=400, 
-                detail=f"Error parsing PDF: {str(pdf_error)}"
-            )
-        
-        return extracted_text.strip()
+            # Extract text using pdfplumber
+            try:
+                with pdfplumber.open(pdf_file) as pdf:
+                    # Extract text from each page and join
+                    extracted_text = "\n".join([
+                        page.extract_text() or "" for page in pdf.pages
+                    ])
+            except Exception as pdf_error:
+                raise HTTPException(
+                    status_code=400, 
+                    detail=f"Error parsing PDF: {str(pdf_error)}"
+                )
+            return {"is_scanned":False,"text":extracted_text.strip()}
     
     except Exception as e:
         raise HTTPException(
             status_code=500, 
             detail=f"Unexpected error extracting text from PDF: {str(e)}"
         )
-###-----------------------------------------------------------------------------------------------------------------------------###
-
-###---------------------------------------Pdf upload to s3 Function --------------------------------------------------------------###
 
 def upload_bytes_to_s3(
     file_bytes: bytes, 
@@ -136,9 +128,18 @@ def upload_bytes_to_s3(
     
     Returns:
         str: S3 object key of uploaded file
+        
+    Raises:
+        HTTPException: If file is too large, invalid type, or upload fails
     """
     try:
-        # Validate file type (optional but recommended)
+        # Check file size (10MB = 10 * 1024 * 1024 bytes)
+        MAX_FILE_SIZE = 10 * 1024 * 1024  # 10MB in bytes
+        file_size = len(file_bytes)
+        if file_size > MAX_FILE_SIZE:
+            raise ValueError(f"File size ({file_size / 1024 / 1024:.2f}MB) exceeds maximum allowed size of 10MB")
+
+        Validate file type (optional but recommended)
         file_type = magic.from_buffer(file_bytes, mime=True)
         if file_type not in ['application/pdf']:
             raise ValueError(f"Invalid file type. Expected PDF, got {file_type}")
@@ -236,6 +237,110 @@ def delete_file_from_s3(bucket_name: str, object_key: str) -> dict:
             detail=f"Unexpected error during S3 deletion: {str(e)}"
         )
 
+def bedrock_calling(system_prompt,prompt_type, pdf_text):
+    """
+    Call AWS Bedrock API with appropriate prompts
+    
+    Args:
+        prompt_type (str): Type of prompt to use
+        pdf_text (str): Extracted text from PDF
+        
+    Returns:
+        JSONResponse: Structured analysis response
+    """
+    payload = {
+        "anthropic_version": "bedrock-2023-05-31",
+        "max_tokens": 4000,
+        "messages": [
+            
+            {
+                "role": "user",
+                "content": f"""{system_prompt} \n\n {prompt_type}"""
+            }
+        ],
+        "temperature": 0.3,
+        "top_p": 0.9,
+        "top_k": 250
+    }
+
+    bedrock = session.client('bedrock-runtime')
+    body = json.dumps(payload)
+    model_id = "us.anthropic.claude-3-5-haiku-20241022-v1:0"
+    
+    response = bedrock.invoke_model(
+        body=body,
+        modelId=model_id,
+        accept="application/json",
+        contentType="application/json",
+    )
+
+    response_body = json.loads(response.get("body").read())
+    response_text = response_body.get("content")[0].get("text")
+    
+    # Extract JSON from response
+    start = response_text.find('{')
+    end = response_text.rfind('}') + 1
+    response_text = response_text[start:end]
+    return json.loads(response_text)
+
+def get_document_class(pdf_text: str) -> dict:
+    """
+    Classify document type using classification prompt
+    
+    Args:
+        pdf_text (str): Extracted text from PDF
+        
+    Returns:
+        dict: Document classification details
+    """
+    classification_prompt = prompts.user_prompt_classification(pdf_text)
+    system_prompt = prompts.system_prompt_for_doc_classification
+    return bedrock_calling(system_prompt =system_prompt,prompt_type = classification_prompt, pdf_text = pdf_text)
+
+def get_document_analysis(doc_class: int, pdf_text: str) -> dict:
+    """
+    Generate appropriate document analysis based on classification
+    
+    Args:
+        doc_class (int): Document class number
+        pdf_text (str): Extracted text from PDF
+        
+    Returns:
+        dict: Document analysis
+    """
+    prompt_mapping = {
+        0: prompts.user_prompt_poi,
+        1: prompts.user_prompt_poa,
+        2: prompts.user_prompt_registration,
+        3: prompts.user_prompt_ownership,
+        4: prompts.user_prompt_tax_return,
+        5: prompts.user_prompt_financial
+    }
+
+    system_prompt_mapping = {
+        0: prompts.system_prompt_for_indentity_doc,
+        1: prompts.system_prompt_for_poa_doc,
+        2: prompts.system_prompt_for_registration_doc,
+        3: prompts.system_prompt_for_ownership_doc,
+        4: prompts.system_prompt_for_tax_return_doc,
+        5: prompts.system_prompt_for_financial_doc
+    }
+
+    if doc_class not in prompt_mapping:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Invalid document class: {doc_class}"
+        )
+
+    user_prompt = prompt_mapping[doc_class](pdf_text, today)
+    #print(user_prompt)
+    system_prompt = system_prompt_mapping[doc_class]
+    #print(system_prompt)
+
+    #print(bedrock_calling(system_prompt = system_prompt,prompt_type =user_prompt,pdf_text = pdf_text))
+    
+    return bedrock_calling(system_prompt = system_prompt,prompt_type = user_prompt, pdf_text = pdf_text)
+
 ###---------------------------------------Define API End-points--------------------------------------------------------------###
 
 @app.post("/upload_pdf")
@@ -270,7 +375,7 @@ async def upload_pdf(file: UploadFile = File(...)):
 
 # API Endpoint for S3 File Deletion
 @app.delete("/delete_file")
-async def delete_file(request: S3DeleteRequest):
+async def delete_s3_file(request: S3DeleteRequest):
     """
     API endpoint to delete a file from S3 bucket
     
@@ -286,85 +391,40 @@ async def delete_file(request: S3DeleteRequest):
             bucket_name=request.bucket_name, 
             object_key=request.object_key
         )
-        
         return result
     
     except HTTPException as e:
         # Re-raise HTTP exceptions
         raise e
 
-# API Endpoint for generating summary from given context of pdf
 @app.post("/generate_summary")
 def generate_summary(request: S3DeleteRequest):
     try:
-        bucket_name = request.bucket_name
-        object_key = request.object_key
-        # pdf_path = request.pdf_path
-        
-        # Extract text from the given pdf path
-        pdf_text = extract_text_from_s3_pdf(bucket_name = bucket_name, object_key = object_key)
-        
-        analysis_type = 'comprehensive'
-        system_prompt = """You are an expert financial analyst with exceptional attention to detail. 
-        Your task is to perform a comprehensive analysis of financial documents, 
-        providing structured, actionable insights."""
-        
-        user_prompt = f"""Perform a {analysis_type} analysis of the following financial document:
-        DOCUMENT TEXT:
-        {pdf_text}
-        
-        COMPREHENSIVE ANALYSIS REQUIREMENTS:
-        1. Identify key financial metrics and their significance
-        2. Highlight potential risks or opportunities
-        3. Compare metrics against industry benchmarks
-        4. Provide a clear, concise summary with actionable insights
-        
-        Respond in the following structured JSON format:
-        {{
-            "summary": "High-level executive summary",
-            "key_metrics": {{
-                "metric_name": {{
-                    "value": "specific value",
-                    "interpretation": "expert analysis"
-                }}
-            }},
-            "risks": ["Risk 1", "Risk 2"],
-            "opportunities": ["Opportunity 1", "Opportunity 2"],
-            "recommendation": "Strategic recommendation based on analysis"
-        }}
-        """
-        
-        payload = {
-            "anthropic_version": "bedrock-2023-05-31",
-            "max_tokens": 4000,
-            "messages": [
-                {
-                    "role": "user",
-                    "content": user_prompt
+            bucket_name = request.bucket_name
+            object_key = request.object_key
+            file_name = request.file_name
+            # Extract text from the given pdf path
+            pdf_text = extract_text_from_s3_pdf(bucket_name = bucket_name, object_key = object_key)
+            if pdf_text["is_scanned"] is True:
+                return {"error" : "Current version does not parse scanned documents"}
+            else:
+                # First, classify the document
+                classification_result = get_document_class(pdf_text)
+                doc_class = classification_result.get('class')
+                # Then generate appropriate analysis based on document class
+                analysis_result = get_document_analysis(doc_class, pdf_text)                
+                # Combine classification and analysis results
+                final_response = {
+                    "document_type": classification_result.get('category'),
+                    "analysis": analysis_result
                 }
-            ],
-            "temperature": 0.3,
-            "top_p": 0.9,
-            "top_k": 250
-        }
-        
-        bedrock = session.client('bedrock-runtime')
-        body = json.dumps(payload)
-        model_id = "us.anthropic.claude-3-5-haiku-20241022-v1:0"
-        
-        response = bedrock.invoke_model(
-            body=body,
-            modelId=model_id,
-            accept="application/json",
-            contentType="application/json",
-        )
-        
-        response_body = json.loads(response.get("body").read())
-        response_text = response_body.get("content")[0].get("text")
-        response_text = json.loads(response_text)
-        
-        return JSONResponse(content=response_text)
-    
+                mongo_obj_id = insert_document(final_response)
+                del final_response["_id"]
+                final_response["mongo_obj_id"] = mongo_obj_id
+                final_response = {"result":final_response}
+                #response_text = json.dumps(final_response)
+                return JSONResponse(content=final_response)        
+     
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
