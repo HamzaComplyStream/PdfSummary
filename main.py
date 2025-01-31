@@ -139,7 +139,7 @@ def upload_bytes_to_s3(
         if file_size > MAX_FILE_SIZE:
             raise ValueError(f"File size ({file_size / 1024 / 1024:.2f}MB) exceeds maximum allowed size of 10MB")
 
-        Validate file type (optional but recommended)
+        # Validate file type (optional but recommended)
         file_type = magic.from_buffer(file_bytes, mime=True)
         if file_type not in ['application/pdf']:
             raise ValueError(f"Invalid file type. Expected PDF, got {file_type}")
